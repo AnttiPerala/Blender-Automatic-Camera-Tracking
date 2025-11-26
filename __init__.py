@@ -182,25 +182,139 @@ class CLIP_OT_autotrack_filter(Operator):
         return (context.area.spaces.active.clip is not None)
 
     def execute(self, context):
+        time_start = time.time()
         scene = context.scene
         clip = context.area.spaces.active.clip
         tracks = clip.tracking.tracks
-        time_start = time.time()
-        
-        # Select bad tracks
-        bpy.ops.clip.filter_tracks(track_threshold=scene.autotrack_filter_threshold)
-        
-        filtered_count = 0
+        current_frame = scene.frame_current
+
+        # --- SETTINGS ---
+        # Hardcoded correlation threshold (0.75 is standard for "good")
+        CORRELATION_MIN = 0.75 
+        MIN_TIME = scene.autotrack_filter_mintime
+
+        # List to hold tracks we want to DELETE (Garbage)
+        tracks_to_delete = []
+        # List to hold tracks we want to STOP (Finished/Slipping)
+        tracks_to_stop = []
+
+        # 1. ANALYZE EXISTING TRACKS
         for track in tracks:
-            if track.select:
-                filtered_count += 1
-                
-        # Optional: Actually delete them? The original script just selected them here?
-        # Standard behavior for a "Filter" button is usually just to select, 
-        # but "Autotrack Filter" usually implies cleanup. 
-        # I'll leave it as select to be safe, but the Main Loop deletes.
+            if track.hide or track.lock:
+                continue
+            
+            # Get the marker for the current frame
+            marker = track.markers.find_frame(current_frame, exact=True)
+            
+            # Check A: Is the track too short? (Time based)
+            # We look back 'rate' frames. If it existed then, but total len is small, it's garbage.
+            prev_marker = track.markers.find_frame(current_frame - scene.autotrack_rate, exact=True)
+            if prev_marker and len(track.markers) < MIN_TIME:
+                tracks_to_delete.append(track)
+                continue
+
+            # Check B: Is the track slipping? (Quality based)
+            # If marker exists and is active, check quality
+            if marker and not marker.mute:
+                if track.average_correlation < CORRELATION_MIN:
+                    # Logic: If it's long enough, keep it but stop tracking.
+                    # If it's too short, kill it.
+                    if len(track.markers) > MIN_TIME:
+                        tracks_to_stop.append(track)
+                    else:
+                        tracks_to_delete.append(track)
+
+        # 2. APPLY DELETIONS
+        bpy.ops.clip.select_all(action='DESELECT')
+        for track in tracks_to_delete:
+            track.select = True
+        if tracks_to_delete:
+            print(f'Deleting {len(tracks_to_delete)} garbage tracks')
+            bpy.ops.clip.delete_track()
         
-        print('Selected %s high-error tracks in %.4f sec' % (filtered_count, time.time() - time_start))
+        # 3. APPLY STOPS (DISABLE)
+        # We don't delete these, we just ensure they are NOT selected for the next pass
+        for track in tracks_to_stop:
+            track.select = False
+            # Optional: Lock it so we know it's "Done"
+            # track.lock = True 
+        if tracks_to_stop:
+            print(f'Stopping {len(tracks_to_stop)} slipping tracks (kept history)')
+
+        # 4. DETECT NEW FEATURES
+        # Deselect everything first so detect_features runs cleanly
+        bpy.ops.clip.select_all(action='DESELECT')
+        bpy.ops.clip.detect_features(
+            threshold=scene.autotrack_detect_threshold,
+            min_distance=scene.autotrack_detect_distance,
+            margin=scene.autotrack_detect_margin,
+            placement=scene.autotrack_detect_placement
+        )
+
+        # Identify which tracks are the "New" ones (they are selected by detect_features)
+        new_trackers = [t for t in tracks if t.select]
+
+        # 5. FILTER OVERLAPPING
+        # We compare New Trackers vs ALL existing visible trackers (Active OR Stopped)
+        # This prevents spawning a new track on top of one we just stopped.
+        
+        # Invert selection to get the "Old" tracks (Active ones)
+        # But we also need to include the ones we just "Stopped" (which are unselected)
+        old_trackers = []
+        for track in tracks:
+            # If it's not a new track, and not hidden, it's an obstacle
+            if track not in new_trackers and not track.hide:
+                # Does it exist on this frame?
+                marker = track.markers.find_frame(current_frame, exact=True)
+                if marker:
+                    old_trackers.append(track)
+
+        trackers_to_remove_overlap = []
+        diaglen = math.sqrt(clip.size[0]**2 + clip.size[1]**2)
+        
+        for new_track in new_trackers:
+            new_marker = new_track.markers.find_frame(current_frame, exact=True)
+            if new_marker:
+                for old_track in old_trackers:
+                    old_marker = old_track.markers.find_frame(current_frame, exact=True)
+                    if old_marker:
+                        distance = (new_marker.co - old_marker.co).length * diaglen
+                        if distance < scene.autotrack_detect_distance:
+                            trackers_to_remove_overlap.append(new_track)
+                            break 
+
+        # Delete the overlapping new ones
+        bpy.ops.clip.select_all(action='DESELECT')
+        for track in trackers_to_remove_overlap:
+            track.select = True
+        bpy.ops.clip.delete_track()
+        if trackers_to_remove_overlap:
+            print(f'Removed {len(trackers_to_remove_overlap)} overlapping candidates')
+
+        # 6. START TRACKING
+        context.area.spaces.active.show_disabled = False
+        
+        # Important: We need to make sure we select the VALID existing tracks + VALID new tracks
+        # The "Stopped" tracks are currently unselected, which is exactly what we want.
+        # But we need to make sure the "Active" old tracks are re-selected.
+        
+        for track in tracks:
+            if track.hide or track.lock:
+                continue
+            if track in tracks_to_stop:
+                continue # Keep these unselected
+            
+            # If it exists on this frame, select it for tracking
+            marker = track.markers.find_frame(current_frame, exact=True)
+            if marker:
+                track.select = True
+
+        # Calculate next stop point
+        self._frame_redetect = current_frame + scene.autotrack_rate
+        
+        print(f'Tracking forward... (Next Detect: Frame {self._frame_redetect})')
+        bpy.ops.clip.track_markers('INVOKE_DEFAULT', backwards=False, sequence=True)
+
         return {'FINISHED'}
 
 
