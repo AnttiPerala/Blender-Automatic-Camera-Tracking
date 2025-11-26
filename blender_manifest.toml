@@ -1,0 +1,11 @@
+schema_version = "1.0.0"
+id = "auto_track"
+version = "1.0.1"
+name = "Auto-tracking"
+tagline = "VFX motion tracking automation"
+maintainer = "anttiperala ecation@gmail.com"
+type = "add-on"
+tags = ["VFX", "Tracking", "Match move", "Motion tracking"]
+blender_version_min = "4.2.0"
+license = "GPL-2.0-or-later"
+website = "https://github.com/miikapuustinen/blender_autotracker"
