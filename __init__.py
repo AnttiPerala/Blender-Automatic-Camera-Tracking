@@ -1,5 +1,4 @@
 # SPDX-FileCopyrightText: 2017-2022 Blender Foundation
-#
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import time
@@ -12,6 +11,9 @@ from bpy.props import (
     EnumProperty
 )
 
+# -------------------------------------------------------------------
+#  OPERATOR: MAIN AUTO TRACKER
+# -------------------------------------------------------------------
 
 class CLIP_OT_autotrack_autotrack(Operator):
     bl_idname = 'autotrack.auto_track'
@@ -36,166 +38,14 @@ class CLIP_OT_autotrack_autotrack(Operator):
         tracks = clip.tracking.tracks
         current_frame = scene.frame_current
 
-        # 1. Filter short tracks (Time based)
-        context.area.spaces.active.show_disabled = True
-        filtered_trackers = []
-        for track in tracks:
-            if track.hide or track.lock:
-                continue
-            # Check if track existed 'rate' frames ago
-            marker = track.markers.find_frame(current_frame - scene.autotrack_rate, exact=True)
-            if marker and len(track.markers) < scene.autotrack_filter_mintime:
-                filtered_trackers.append(track)
-
-        bpy.ops.clip.select_all(action='DESELECT')
-        for track in filtered_trackers:
-            track.select = True
-        bpy.ops.clip.delete_track()
-        if filtered_trackers:
-            print('Filtered %s short trackers' % len(filtered_trackers))
-        filtered_trackers.clear()
-
-        # 2. Filter High Error tracks (Quality based)
-        # This was missing from the loop previously
-        bpy.ops.clip.select_all(action='SELECT')
-        bpy.ops.clip.filter_tracks(track_threshold=scene.autotrack_filter_threshold)
-        bpy.ops.clip.delete_track()
-
-        # 3. Detect new features
-        bpy.ops.clip.select_all(action='DESELECT')
-        bpy.ops.clip.detect_features(
-            threshold=scene.autotrack_detect_threshold,
-            min_distance=scene.autotrack_detect_distance,
-            margin=scene.autotrack_detect_margin,
-            placement=scene.autotrack_detect_placement
-        )
-
-        # Store new trackers
-        new_trackers = []
-        for track in tracks:
-            if track.select:
-                new_trackers.append(track)
-                track.frames_limit = scene.autotrack_rate
-        
-        # 4. Filter overlapping trackers
-        bpy.ops.clip.select_all(action='INVERT')
-        old_trackers = []
-        for track in tracks:
-            if track.select and not (track.hide or track.lock):
-                marker = track.markers.find_frame(current_frame, exact=True)
-                if marker and not marker.mute:
-                    old_trackers.append(track)
-
-        filtered_trackers = []
-        diaglen = math.sqrt(clip.size[0]**2 + clip.size[1]**2)
-        
-        for new_track in new_trackers:
-            new_marker = new_track.markers.find_frame(current_frame, exact=True)
-            if new_marker:
-                for old_track in old_trackers:
-                    old_marker = old_track.markers.find_frame(current_frame, exact=True)
-                    if old_marker:
-                        distance = (new_marker.co - old_marker.co).length * diaglen
-                        if distance < scene.autotrack_detect_distance:
-                            filtered_trackers.append(new_track)
-                            break # Optimization: Found one overlap, stop checking this new track
-
-        bpy.ops.clip.select_all(action='DESELECT')
-        for track in filtered_trackers:
-            track.select = True
-        bpy.ops.clip.delete_track()
-        if filtered_trackers:
-            print('Filtered %s overlapping trackers' % len(filtered_trackers))
-
-        # 5. Start tracking
-        context.area.spaces.active.show_disabled = False
-        bpy.ops.clip.select_all(action='SELECT')
-        
-        # Calculate next stop point
-        self._frame_redetect = current_frame + scene.autotrack_rate
-        
-        print(f'Tracking forward... (Next Detect: Frame {self._frame_redetect})')
-        bpy.ops.clip.track_markers('INVOKE_DEFAULT', backwards=False, sequence=True)
-
-        return {'FINISHED'}
-
-    def modal(self, context, event):
-        if event.type in {'ESC'}:
-            print('Cancelling Auto Track...')
-            self.cancel(context)
-            return {'CANCELLED'}
-
-        if event.type == 'TIMER':
-            if context.scene.frame_current >= context.scene.frame_end:
-                print('End of clip reached')
-                self.cancel(context)
-                return {'FINISHED'}
-            
-            if self._frame_changed:
-                self._frame_changed = False
-                
-                # CRITICAL FIX: Only run logic if we reached the target frame.
-                # If user hit ESC during tracking, frame_current will be < _frame_redetect.
-                # In that case, we simply wait (do nothing) until user manually tracks 
-                # or scrubs to the target frame, effectively pausing the process.
-                if self._frame_redetect == -1 or context.scene.frame_current >= self._frame_redetect:
-                    self.execute(context)
-                
-            return {'PASS_THROUGH'}
-        
-        return {'RUNNING_MODAL'}
-
-    def invoke(self, context, event):
-        wm = context.window_manager
-        wm.modal_handler_add(self)
-        bpy.app.handlers.frame_change_post.append(self._frame_change_event)
-        self._timer = wm.event_timer_add(time_step=0.5, window=context.window) # Faster timer check
-        self._frame_changed = False
-        self._frame_redetect = -1
-        self.execute(context)
-        return {'RUNNING_MODAL'}
-
-    def cancel(self, context):
-        # Safety cleanup
-        try:
-            bpy.app.handlers.frame_change_post.remove(self._frame_change_event)
-        except:
-            pass
-        wm = context.window_manager
-        if hasattr(self, '_timer'):
-            wm.event_timer_remove(self._timer)
-        
-        if context.area and context.area.spaces.active and context.area.spaces.active.clip:
-            for track in context.area.spaces.active.clip.tracking.tracks:
-                track.frames_limit = 0
-        print("Auto Track Finished/Cancelled")
-
-
-class CLIP_OT_autotrack_filter(Operator):
-    bl_idname = 'autotrack.filter'
-    bl_label = 'Filter All Tracks'
-    bl_description = 'Apply filters to all tracks'
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return (context.area.spaces.active.clip is not None)
-
-    def execute(self, context):
-        time_start = time.time()
-        scene = context.scene
-        clip = context.area.spaces.active.clip
-        tracks = clip.tracking.tracks
-        current_frame = scene.frame_current
-
         # --- SETTINGS ---
-        # Hardcoded correlation threshold (0.75 is standard for "good")
+        # Correlation: 1.0 is perfect, < 0.7 is usually slipping.
+        # We use this instead of Reprojection Error (which is 0.0 before solving).
         CORRELATION_MIN = 0.75 
         MIN_TIME = scene.autotrack_filter_mintime
 
-        # List to hold tracks we want to DELETE (Garbage)
+        # Lists for action
         tracks_to_delete = []
-        # List to hold tracks we want to STOP (Finished/Slipping)
         tracks_to_stop = []
 
         # 1. ANALYZE EXISTING TRACKS
@@ -203,21 +53,20 @@ class CLIP_OT_autotrack_filter(Operator):
             if track.hide or track.lock:
                 continue
             
-            # Get the marker for the current frame
+            # Check if track is active on this frame
             marker = track.markers.find_frame(current_frame, exact=True)
             
-            # Check A: Is the track too short? (Time based)
+            # Check A: Is the track too short? (Time based cleanup)
             # We look back 'rate' frames. If it existed then, but total len is small, it's garbage.
             prev_marker = track.markers.find_frame(current_frame - scene.autotrack_rate, exact=True)
             if prev_marker and len(track.markers) < MIN_TIME:
                 tracks_to_delete.append(track)
                 continue
 
-            # Check B: Is the track slipping? (Quality based)
-            # If marker exists and is active, check quality
+            # Check B: Is the track slipping? (Quality based cleanup)
             if marker and not marker.mute:
                 if track.average_correlation < CORRELATION_MIN:
-                    # Logic: If it's long enough, keep it but stop tracking.
+                    # Logic: If it's long enough, keep it but stop tracking (save history).
                     # If it's too short, kill it.
                     if len(track.markers) > MIN_TIME:
                         tracks_to_stop.append(track)
@@ -233,13 +82,10 @@ class CLIP_OT_autotrack_filter(Operator):
             bpy.ops.clip.delete_track()
         
         # 3. APPLY STOPS (DISABLE)
-        # We don't delete these, we just ensure they are NOT selected for the next pass
         for track in tracks_to_stop:
-            track.select = False
-            # Optional: Lock it so we know it's "Done"
-            # track.lock = True 
+            track.select = False # Deselecting stops the tracker from updating it next pass
         if tracks_to_stop:
-            print(f'Stopping {len(tracks_to_stop)} slipping tracks (kept history)')
+            print(f'Stopping {len(tracks_to_stop)} slipping tracks')
 
         # 4. DETECT NEW FEATURES
         # Deselect everything first so detect_features runs cleanly
@@ -251,20 +97,14 @@ class CLIP_OT_autotrack_filter(Operator):
             placement=scene.autotrack_detect_placement
         )
 
-        # Identify which tracks are the "New" ones (they are selected by detect_features)
+        # Identify "New" tracks (selected by detect_features)
         new_trackers = [t for t in tracks if t.select]
 
         # 5. FILTER OVERLAPPING
-        # We compare New Trackers vs ALL existing visible trackers (Active OR Stopped)
-        # This prevents spawning a new track on top of one we just stopped.
-        
-        # Invert selection to get the "Old" tracks (Active ones)
-        # But we also need to include the ones we just "Stopped" (which are unselected)
+        # Compare New Trackers vs ALL existing visible trackers (Active OR Stopped)
         old_trackers = []
         for track in tracks:
-            # If it's not a new track, and not hidden, it's an obstacle
             if track not in new_trackers and not track.hide:
-                # Does it exist on this frame?
                 marker = track.markers.find_frame(current_frame, exact=True)
                 if marker:
                     old_trackers.append(track)
@@ -283,7 +123,6 @@ class CLIP_OT_autotrack_filter(Operator):
                             trackers_to_remove_overlap.append(new_track)
                             break 
 
-        # Delete the overlapping new ones
         bpy.ops.clip.select_all(action='DESELECT')
         for track in trackers_to_remove_overlap:
             track.select = True
@@ -294,15 +133,12 @@ class CLIP_OT_autotrack_filter(Operator):
         # 6. START TRACKING
         context.area.spaces.active.show_disabled = False
         
-        # Important: We need to make sure we select the VALID existing tracks + VALID new tracks
-        # The "Stopped" tracks are currently unselected, which is exactly what we want.
-        # But we need to make sure the "Active" old tracks are re-selected.
-        
+        # Select valid tracks for the next tracking pass
         for track in tracks:
             if track.hide or track.lock:
                 continue
             if track in tracks_to_stop:
-                continue # Keep these unselected
+                continue # Keep these unselected/stopped
             
             # If it exists on this frame, select it for tracking
             marker = track.markers.find_frame(current_frame, exact=True)
@@ -314,9 +150,187 @@ class CLIP_OT_autotrack_filter(Operator):
         
         print(f'Tracking forward... (Next Detect: Frame {self._frame_redetect})')
         bpy.ops.clip.track_markers('INVOKE_DEFAULT', backwards=False, sequence=True)
+        
+        # Force UI update for stats
+        context.area.tag_redraw()
 
         return {'FINISHED'}
 
+    def modal(self, context, event):
+        if event.type in {'ESC'}:
+            print('Cancelling Auto Track...')
+            self.cancel(context)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            if context.scene.frame_current >= context.scene.frame_end:
+                print('End of clip reached')
+                self.cancel(context)
+                return {'FINISHED'}
+            
+            if self._frame_changed:
+                self._frame_changed = False
+                # CRITICAL FIX: Only run logic if we reached the target frame.
+                if self._frame_redetect == -1 or context.scene.frame_current >= self._frame_redetect:
+                    self.execute(context)
+            return {'PASS_THROUGH'}
+        
+        return {'RUNNING_MODAL'}
+
+    def invoke(self, context, event):
+        wm = context.window_manager
+        wm.modal_handler_add(self)
+        bpy.app.handlers.frame_change_post.append(self._frame_change_event)
+        self._timer = wm.event_timer_add(time_step=0.5, window=context.window)
+        self._frame_changed = False
+        self._frame_redetect = -1
+        self.execute(context)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        try:
+            bpy.app.handlers.frame_change_post.remove(self._frame_change_event)
+        except:
+            pass
+        wm = context.window_manager
+        if hasattr(self, '_timer'):
+            wm.event_timer_remove(self._timer)
+        
+        if context.area and context.area.spaces.active and context.area.spaces.active.clip:
+            for track in context.area.spaces.active.clip.tracking.tracks:
+                track.frames_limit = 0
+        context.area.tag_redraw()
+        print("Auto Track Finished/Cancelled")
+
+
+# -------------------------------------------------------------------
+#  OPERATOR: AUTO SOLVE & CLEAN
+# -------------------------------------------------------------------
+
+class CLIP_OT_autotrack_autosolve(Operator):
+    bl_idname = 'autotrack.auto_solve'
+    bl_label = 'Auto Solve & Clean'
+    bl_description = 'Iteratively solves and removes the worst tracker until error stops improving'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        clip = context.area.spaces.active.clip
+        if not clip:
+            self.report({'ERROR'}, "No clip active")
+            return {'CANCELLED'}
+
+        tracks = clip.tracking.tracks
+        
+        # Safety limits
+        MAX_ITERATIONS = 20
+        TARGET_ERROR = 0.3  # If we hit this, stop (it's good enough)
+        
+        print("--- Starting Auto Solve ---")
+        
+        # Initial Solve
+        bpy.ops.clip.solve_camera()
+        
+        if not clip.tracking.solution.has_solution:
+            self.report({'ERROR'}, "Initial solve failed. Need at least 8 good tracks.")
+            return {'CANCELLED'}
+
+        best_error = clip.tracking.solution.error
+        print(f"Initial Error: {best_error:.4f}")
+
+        last_disabled_track = None
+        tracks_disabled_count = 0
+
+        for i in range(MAX_ITERATIONS):
+            # 1. Check perfection
+            if best_error <= TARGET_ERROR:
+                print(f"Target error {TARGET_ERROR} reached.")
+                break
+
+            # 2. Find worst ACTIVE track
+            worst_track = None
+            max_track_error = -1.0
+
+            for track in tracks:
+                if track.weight > 0.0 and not track.hide:
+                    if track.average_error > max_track_error:
+                        max_track_error = track.average_error
+                        worst_track = track
+
+            if not worst_track:
+                print("No more tracks to prune.")
+                break
+
+            # 3. Soft Delete (Weight 0)
+            last_weight = worst_track.weight
+            worst_track.weight = 0.0
+            
+            # 4. Solve again
+            bpy.ops.clip.solve_camera()
+            new_error = clip.tracking.solution.error
+            
+            # 5. Check result
+            if new_error < best_error:
+                print(f"Iter {i+1}: Removed '{worst_track.name}' (Err: {max_track_error:.2f}). Solution improved: {best_error:.4f} -> {new_error:.4f}")
+                best_error = new_error
+                last_disabled_track = None
+                tracks_disabled_count += 1
+            else:
+                print(f"Iter {i+1}: Removing '{worst_track.name}' made it worse ({new_error:.4f}). Reverting...")
+                worst_track.weight = last_weight
+                bpy.ops.clip.solve_camera() # Revert solve state
+                break
+
+        # 6. Final Cleanup
+        if tracks_disabled_count > 0:
+            bpy.ops.clip.select_all(action='DESELECT')
+            count_deleted = 0
+            for track in tracks:
+                if track.weight == 0.0:
+                    track.select = True
+                    count_deleted += 1
+            
+            bpy.ops.clip.delete_track()
+            self.report({'INFO'}, f"Auto Solve Finished. Error: {best_error:.4f}. Deleted {count_deleted} tracks.")
+        else:
+            self.report({'INFO'}, "Auto Solve Finished. No tracks removed.")
+        
+        context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+# -------------------------------------------------------------------
+#  OPERATOR: MANUAL FILTER (Legacy/Helper)
+# -------------------------------------------------------------------
+
+class CLIP_OT_autotrack_filter(Operator):
+    bl_idname = 'autotrack.filter'
+    bl_label = 'Filter All Tracks'
+    bl_description = 'Select tracks based on the Error Threshold setting'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.area.spaces.active.clip is not None)
+
+    def execute(self, context):
+        scene = context.scene
+        clip = context.area.spaces.active.clip
+        tracks = clip.tracking.tracks
+        time_start = time.time()
+        
+        bpy.ops.clip.filter_tracks(
+            track_threshold=scene.autotrack_filter_threshold,
+        )
+        
+        count = sum(1 for t in tracks if t.select)
+        print(f'Selected {count} high-error tracks in {time.time() - time_start:.4f} sec')
+        return {'FINISHED'}
+
+
+# -------------------------------------------------------------------
+#  PANELS
+# -------------------------------------------------------------------
 
 class CLIP_PT_autotrack_main(Panel):
     bl_label = 'Auto-track'
@@ -330,6 +344,41 @@ class CLIP_PT_autotrack_main(Panel):
         layout.use_property_split = True
         layout.use_property_decorate = False
 
+        # --- STATISTICS SECTION ---
+        clip = context.area.spaces.active.clip
+        count_total = 0
+        count_active = 0
+        count_finished = 0
+        solve_error = 0.0
+        
+        if clip:
+            tracks = clip.tracking.tracks
+            count_total = len(tracks)
+            if clip.tracking.solution.has_solution:
+                solve_error = clip.tracking.solution.error
+
+            for t in tracks:
+                if t.hide: continue 
+                if t.select: count_active += 1
+                else: count_finished += 1
+
+        box = layout.box()
+        col = box.column(align=True)
+        
+        row = col.row()
+        row.alignment = 'EXPAND'
+        row.label(text=f"Total: {count_total}")
+        if solve_error > 0:
+            row.label(text=f"Error: {solve_error:.2f}px")
+        
+        row = col.row()
+        row.alignment = 'EXPAND'
+        row.label(text=f"Active: {count_active}", icon='Dot')
+        row.label(text=f"Finished: {count_finished}", icon='SOLO_OFF')
+
+        layout.separator()
+
+        # --- TRACKING CONTROLS ---
         col = layout.column(align=True)
         col.scale_y = 1.5
         col.operator('autotrack.auto_track', text='Start Auto Track', icon='CON_FOLLOWTRACK')
@@ -338,12 +387,16 @@ class CLIP_PT_autotrack_main(Panel):
         col.separator()
         col.label(text="Main Settings:")
         col.prop(scene, "autotrack_rate")
-        
-        # EXPOSED: The filtering thresholds are now in the main panel
-        col.separator()
-        col.label(text="Deletion Criteria:")
-        col.prop(scene, "autotrack_filter_threshold", text="Error Threshold")
+        # These settings affect both auto-track cleanup and auto-solve
+        col.prop(scene, "autotrack_filter_threshold", text="Error Threshold") 
         col.prop(scene, 'autotrack_filter_mintime', text="Min Duration")
+
+        # --- SOLVING CONTROLS ---
+        layout.separator()
+        layout.label(text="Solving:")
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        col.operator('autotrack.auto_solve', text='Auto Solve & Clean', icon='TRIA_RIGHT')
 
 
 class CLIP_PT_autotrack_tracker_settings(Panel):
@@ -351,7 +404,7 @@ class CLIP_PT_autotrack_tracker_settings(Panel):
     bl_space_type = 'CLIP_EDITOR'
     bl_region_type = 'TOOLS'
     bl_category = 'Auto-track'
-    bl_options = {'DEFAULT_CLOSED'} # Collapsed by default to clean up UI
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
@@ -403,14 +456,18 @@ class CLIP_PT_autotrack_filter_settings(Panel):
         scene = context.scene
         layout = self.layout
         layout.use_property_split = True
-        
         col = layout.column(align=True)
         col.scale_y = 1.5
         col.operator('autotrack.filter', text='Select High Error', icon='FILTER')
 
 
+# -------------------------------------------------------------------
+#  REGISTRATION
+# -------------------------------------------------------------------
+
 classes = (
     CLIP_OT_autotrack_autotrack,
+    CLIP_OT_autotrack_autosolve,
     CLIP_OT_autotrack_filter,
     CLIP_PT_autotrack_main,
     CLIP_PT_autotrack_tracker_settings,
@@ -423,6 +480,7 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    # Autotrack Properties
     Scene.autotrack_rate = IntProperty(
         name='Update Interval',
         description='How many frames to track before cleaning up and detecting new features',
@@ -430,6 +488,7 @@ def register():
         min=1
     )
 
+    # Feature Detection Properties
     Scene.autotrack_detect_margin = IntProperty(
         name='Margin',
         description='Distance from edge of image detected features must be',
@@ -439,38 +498,42 @@ def register():
     )
     Scene.autotrack_detect_threshold = FloatProperty(
         name='Detect Threshold',
-        description='Quality threshold for feature detection (Lower = more features)',
+        description='Minimum threshold value for a feature to be considered',
         precision=3,
         default=0.1,
         min=0.001,
     )
     Scene.autotrack_detect_distance = IntProperty(
         name='Distance',
-        description='Minimum distance between detected features',
+        description='Minimum distance detected features must be from each other',
         subtype='PIXEL',
         default=60,
         min=5
     )
     Scene.autotrack_detect_placement = EnumProperty(
         name='Allowed Placement',
+        description='Allowed areas to detect new features',
         items=(
-                ("FRAME", "Whole Frame", ""),
-                ("INSIDE_GPENCIL", "Inside Grease Pencil", ""),
-                ("OUTSIDE_GPENCIL", "Outside Grease Pencil", "")
+                ("FRAME", "Whole Frame", "The entire frame can be used for feature detection"),
+                ("INSIDE_GPENCIL", "Inside Grease Pencil",
+                    "Only areas inside the grease mask can be used for feature detection"),
+                ("OUTSIDE_GPENCIL", "Outside Grease Pencil",
+                    "Only areas outside the grease mask can be used for feature detection")
         ),
         default='FRAME'
     )
 
+    # Filter Properties
     Scene.autotrack_filter_threshold = FloatProperty(
-        name='Error Threshold',
-        description='Maximum allowed reprojection error. Tracks above this are deleted automatically',
-        precision=2,
+        name='Threshold',
+        description='Max Reprojection Error allowed (used by Auto Solve & Manual Filter)',
+        precision=3,
         default=5.0,
         min=0.0,
     )
     Scene.autotrack_filter_mintime = IntProperty(
-        name='Min Duration',
-        description='Tracks shorter than this (in frames) are deleted during cleanup',
+        name='Minimum Track Time',
+        description='Minimum amount of frames a tracker should have a valid track to be kept',
         default=15,
         min=0
     )
