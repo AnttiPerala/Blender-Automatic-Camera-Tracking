@@ -8,7 +8,8 @@ from bpy.types import Operator, Panel, Scene
 from bpy.props import (
     IntProperty,
     FloatProperty,
-    EnumProperty
+    EnumProperty,
+    BoolProperty
 )
 
 # -------------------------------------------------------------------
@@ -39,8 +40,6 @@ class CLIP_OT_autotrack_autotrack(Operator):
         current_frame = scene.frame_current
 
         # --- SETTINGS ---
-        # Correlation: 1.0 is perfect, < 0.7 is usually slipping.
-        # We use this instead of Reprojection Error (which is 0.0 before solving).
         CORRELATION_MIN = 0.75 
         MIN_TIME = scene.autotrack_filter_mintime
 
@@ -57,7 +56,6 @@ class CLIP_OT_autotrack_autotrack(Operator):
             marker = track.markers.find_frame(current_frame, exact=True)
             
             # Check A: Is the track too short? (Time based cleanup)
-            # We look back 'rate' frames. If it existed then, but total len is small, it's garbage.
             prev_marker = track.markers.find_frame(current_frame - scene.autotrack_rate, exact=True)
             if prev_marker and len(track.markers) < MIN_TIME:
                 tracks_to_delete.append(track)
@@ -170,7 +168,6 @@ class CLIP_OT_autotrack_autotrack(Operator):
             
             if self._frame_changed:
                 self._frame_changed = False
-                # CRITICAL FIX: Only run logic if we reached the target frame.
                 if self._frame_redetect == -1 or context.scene.frame_current >= self._frame_redetect:
                     self.execute(context)
             return {'PASS_THROUGH'}
@@ -210,7 +207,7 @@ class CLIP_OT_autotrack_autotrack(Operator):
 class CLIP_OT_autotrack_autosolve(Operator):
     bl_idname = 'autotrack.auto_solve'
     bl_label = 'Auto Solve & Clean'
-    bl_description = 'Iteratively solves and removes the worst tracker until error stops improving'
+    bl_description = 'Iteratively solves and removes worst/failed trackers until error stops improving'
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -219,69 +216,97 @@ class CLIP_OT_autotrack_autosolve(Operator):
         if not clip:
             self.report({'ERROR'}, "No clip active")
             return {'CANCELLED'}
+        
+        active_obj = clip.tracking.objects.active
+        if not active_obj:
+            self.report({'ERROR'}, "No active tracking object found")
+            return {'CANCELLED'}
 
         tracks = clip.tracking.tracks
         
-        # Safety limits
         MAX_ITERATIONS = 20
-        TARGET_ERROR = 0.3  # If we hit this, stop (it's good enough)
+        TARGET_ERROR = 0.3
         
-        print("--- Starting Auto Solve ---")
+        # User settings
+        delete_failed = scene.autotrack_solve_delete_failed
+        delete_count = scene.autotrack_solve_delete_count
+        
+        print(f"--- Starting Auto Solve (Remove {delete_count} worst + Failed: {delete_failed}) ---")
         
         # Initial Solve
         bpy.ops.clip.solve_camera()
         
-        if not clip.tracking.solution.has_solution:
+        if not active_obj.reconstruction.is_valid:
             self.report({'ERROR'}, "Initial solve failed. Need at least 8 good tracks.")
             return {'CANCELLED'}
 
-        best_error = clip.tracking.solution.error
+        best_error = active_obj.reconstruction.average_error
         print(f"Initial Error: {best_error:.4f}")
 
-        last_disabled_track = None
         tracks_disabled_count = 0
 
         for i in range(MAX_ITERATIONS):
-            # 1. Check perfection
             if best_error <= TARGET_ERROR:
                 print(f"Target error {TARGET_ERROR} reached.")
                 break
 
-            # 2. Find worst ACTIVE track
-            worst_track = None
-            max_track_error = -1.0
+            # --- IDENTIFY TRACKS TO PRUNE ---
+            candidates_to_prune = [] # List of tuples (track, reason_string)
+            
+            # 1. Identify Failed Reconstructions (Has no 3D Bundle)
+            if delete_failed:
+                for track in tracks:
+                    # weight > 0 means it's currently used. 
+                    # has_bundle == False means solve failed for this specific track.
+                    if track.weight > 0.0 and not track.hide and not track.has_bundle:
+                        candidates_to_prune.append(track)
 
-            for track in tracks:
-                if track.weight > 0.0 and not track.hide:
-                    if track.average_error > max_track_error:
-                        max_track_error = track.average_error
-                        worst_track = track
+            # 2. Identify Worst N Trackers
+            # Filter only valid tracks that HAVE a bundle (otherwise they have no error to measure)
+            valid_tracks = [t for t in tracks if t.weight > 0.0 and not t.hide and t.has_bundle]
+            
+            # Sort by error (Descending)
+            valid_tracks.sort(key=lambda t: t.average_error, reverse=True)
+            
+            # Take the top N
+            worst_n = valid_tracks[:delete_count]
+            for t in worst_n:
+                if t not in candidates_to_prune:
+                    candidates_to_prune.append(t)
 
-            if not worst_track:
+            if not candidates_to_prune:
                 print("No more tracks to prune.")
                 break
 
-            # 3. Soft Delete (Weight 0)
-            last_weight = worst_track.weight
-            worst_track.weight = 0.0
+            # --- SOFT DELETE & BACKUP ---
+            # Store original weights to revert if needed
+            history = {track: track.weight for track in candidates_to_prune}
             
-            # 4. Solve again
+            # Set weight to 0
+            for track in candidates_to_prune:
+                track.weight = 0.0
+            
+            # --- SOLVE AGAIN ---
             bpy.ops.clip.solve_camera()
-            new_error = clip.tracking.solution.error
+            new_error = active_obj.reconstruction.average_error
             
-            # 5. Check result
+            # --- CHECK RESULT ---
             if new_error < best_error:
-                print(f"Iter {i+1}: Removed '{worst_track.name}' (Err: {max_track_error:.2f}). Solution improved: {best_error:.4f} -> {new_error:.4f}")
+                # IMPROVEMENT: Keep changes
+                track_names = ", ".join([t.name for t in candidates_to_prune])
+                print(f"Iter {i+1}: Disabled {len(candidates_to_prune)} tracks. Improvement: {best_error:.4f} -> {new_error:.4f}")
                 best_error = new_error
-                last_disabled_track = None
-                tracks_disabled_count += 1
+                tracks_disabled_count += len(candidates_to_prune)
             else:
-                print(f"Iter {i+1}: Removing '{worst_track.name}' made it worse ({new_error:.4f}). Reverting...")
-                worst_track.weight = last_weight
-                bpy.ops.clip.solve_camera() # Revert solve state
+                # WORSE: Revert changes
+                print(f"Iter {i+1}: Removing {len(candidates_to_prune)} tracks made it worse ({new_error:.4f}). Reverting & Stopping.")
+                for track, old_weight in history.items():
+                    track.weight = old_weight
+                
+                bpy.ops.clip.solve_camera() # Restore solver state
                 break
 
-        # 6. Final Cleanup
+        # Final Cleanup
         if tracks_disabled_count > 0:
             bpy.ops.clip.select_all(action='DESELECT')
             count_deleted = 0
@@ -291,16 +316,16 @@ class CLIP_OT_autotrack_autosolve(Operator):
                     count_deleted += 1
             
             bpy.ops.clip.delete_track()
-            self.report({'INFO'}, f"Auto Solve Finished. Error: {best_error:.4f}. Deleted {count_deleted} tracks.")
+            self.report({'INFO'}, f"Finished. Error: {best_error:.4f}. Deleted {count_deleted} tracks.")
         else:
-            self.report({'INFO'}, "Auto Solve Finished. No tracks removed.")
+            self.report({'INFO'}, "Finished. No tracks removed.")
         
         context.area.tag_redraw()
         return {'FINISHED'}
 
 
 # -------------------------------------------------------------------
-#  OPERATOR: MANUAL FILTER (Legacy/Helper)
+#  OPERATOR: MANUAL FILTER
 # -------------------------------------------------------------------
 
 class CLIP_OT_autotrack_filter(Operator):
@@ -354,8 +379,10 @@ class CLIP_PT_autotrack_main(Panel):
         if clip:
             tracks = clip.tracking.tracks
             count_total = len(tracks)
-            if clip.tracking.solution.has_solution:
-                solve_error = clip.tracking.solution.error
+            
+            active_obj = clip.tracking.objects.active
+            if active_obj and active_obj.reconstruction.is_valid:
+                solve_error = active_obj.reconstruction.average_error
 
             for t in tracks:
                 if t.hide: continue 
@@ -373,7 +400,7 @@ class CLIP_PT_autotrack_main(Panel):
         
         row = col.row()
         row.alignment = 'EXPAND'
-        row.label(text=f"Active: {count_active}", icon='Dot')
+        row.label(text=f"Active: {count_active}", icon='DOT')
         row.label(text=f"Finished: {count_finished}", icon='SOLO_OFF')
 
         layout.separator()
@@ -387,14 +414,18 @@ class CLIP_PT_autotrack_main(Panel):
         col.separator()
         col.label(text="Main Settings:")
         col.prop(scene, "autotrack_rate")
-        # These settings affect both auto-track cleanup and auto-solve
-        col.prop(scene, "autotrack_filter_threshold", text="Error Threshold") 
         col.prop(scene, 'autotrack_filter_mintime', text="Min Duration")
 
         # --- SOLVING CONTROLS ---
         layout.separator()
         layout.label(text="Solving:")
+        
+        # New Solver Settings
         col = layout.column(align=True)
+        col.prop(scene, "autotrack_solve_delete_failed", text="Del. Failed Reconstruct")
+        col.prop(scene, "autotrack_solve_delete_count", text="Del. Worst (Batch)")
+        
+        col.separator()
         col.scale_y = 1.5
         col.operator('autotrack.auto_solve', text='Auto Solve & Clean', icon='TRIA_RIGHT')
 
@@ -458,6 +489,7 @@ class CLIP_PT_autotrack_filter_settings(Panel):
         layout.use_property_split = True
         col = layout.column(align=True)
         col.scale_y = 1.5
+        col.prop(scene, "autotrack_filter_threshold", text="Error Threshold") 
         col.operator('autotrack.filter', text='Select High Error', icon='FILTER')
 
 
@@ -536,6 +568,20 @@ def register():
         description='Minimum amount of frames a tracker should have a valid track to be kept',
         default=15,
         min=0
+    )
+    
+    # Auto Solve Properties
+    Scene.autotrack_solve_delete_failed = BoolProperty(
+        name='Delete Failed',
+        description='Delete tracks that Blender failed to reconstruct 3D positions for',
+        default=True
+    )
+    Scene.autotrack_solve_delete_count = IntProperty(
+        name='Delete Count',
+        description='Number of worst tracks to remove per iteration',
+        default=1,
+        min=1,
+        max=50
     )
 
 
