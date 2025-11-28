@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "auto_track"
-version = "1.0.1"
+version = "1.0.2"
 name = "Auto-tracking"
 tagline = "VFX motion tracking automation"
 maintainer = "anttiperala ecation@gmail.com"
