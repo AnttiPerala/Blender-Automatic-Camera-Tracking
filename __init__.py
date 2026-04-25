@@ -53,6 +53,25 @@ def count_recent_valid_markers(track, start_frame, end_frame):
 def track_key(track):
     return track.as_pointer()
 
+def get_clip_space(context):
+    if not context.area:
+        return None
+    for space in context.area.spaces:
+        if space.type == 'CLIP_EDITOR':
+            return space
+    return None
+
+def set_tracking_frame(context, frame):
+    context.scene.frame_set(frame)
+    space = get_clip_space(context)
+    clip_user = getattr(space, 'clip_user', None) if space else None
+    if clip_user and hasattr(clip_user, 'frame_current'):
+        try:
+            clip_user.frame_current = frame
+        except Exception:
+            pass
+    return context.scene.frame_current
+
 def count_trackable_tracks(tracks, frame):
     count = 0
     for track in tracks:
@@ -68,6 +87,14 @@ def set_track_selected(track, selected):
     for attr in ('select_anchor', 'select_pattern', 'select_search'):
         if hasattr(track, attr):
             setattr(track, attr, selected)
+
+def delete_tracks(tracks):
+    if not tracks:
+        return
+    bpy.ops.clip.select_all(action='DESELECT')
+    for track in tracks:
+        set_track_selected(track, True)
+    bpy.ops.clip.delete_track()
 
 def get_setting(settings, attr):
     return getattr(settings, attr) if hasattr(settings, attr) else None
@@ -358,8 +385,7 @@ class CLIP_OT_autotrack_autotrack(Operator):
         frame_end = scene.frame_end
 
         if current_frame < scene.frame_start:
-            scene.frame_set(scene.frame_start)
-            current_frame = scene.frame_current
+            current_frame = set_tracking_frame(context, scene.frame_start)
         elif current_frame > frame_end:
             log_msg(scene, 'Current frame is past the render end frame', 'ERROR')
             self.cancel(context)
@@ -392,13 +418,9 @@ class CLIP_OT_autotrack_autotrack(Operator):
                     tracks_to_delete.append(track)
 
         # 2. ACT
-        bpy.ops.clip.select_all(action='DESELECT')
-        
-        for track in tracks_to_delete:
-            set_track_selected(track, True)
         if tracks_to_delete:
             log_msg(scene, f'Deleted {len(tracks_to_delete)} garbage tracks', 'TRASH')
-            bpy.ops.clip.delete_track()
+            delete_tracks(tracks_to_delete)
         
         for track in tracks_to_stop:
             set_track_selected(track, False)
@@ -439,6 +461,12 @@ class CLIP_OT_autotrack_autotrack(Operator):
             )
             new_trackers = [t for t in tracks if track_key(t) not in existing_track_keys]
 
+        if len(new_trackers) > scene.autotrack_max_new_tracks:
+            overflow = new_trackers[scene.autotrack_max_new_tracks:]
+            delete_tracks(overflow)
+            new_trackers = new_trackers[:scene.autotrack_max_new_tracks]
+            log_msg(scene, f'Capped new tracks to {scene.autotrack_max_new_tracks}', 'FILTER')
+
         # 4. OVERLAP
         old_trackers = []
         for track in tracks:
@@ -465,11 +493,8 @@ class CLIP_OT_autotrack_autotrack(Operator):
                             trackers_to_remove_overlap.append(new_track)
                             break 
 
-        bpy.ops.clip.select_all(action='DESELECT')
-        for track in trackers_to_remove_overlap:
-            set_track_selected(track, True)
         if trackers_to_remove_overlap:
-            bpy.ops.clip.delete_track()
+            delete_tracks(trackers_to_remove_overlap)
             log_msg(scene, f'Removed {len(trackers_to_remove_overlap)} overlapping new tracks', 'X')
 
         # 5. TRACK
@@ -535,8 +560,7 @@ class CLIP_OT_autotrack_autotrack(Operator):
 
     def invoke(self, context, event):
         scene = context.scene
-        if scene.frame_current < scene.frame_start or scene.frame_current > scene.frame_end:
-            scene.frame_set(scene.frame_start)
+        set_tracking_frame(context, scene.frame_start)
 
         clip = context.area.spaces.active.clip
         if scene.autotrack_tracking_strategy == 'AUTO':
@@ -882,6 +906,7 @@ class CLIP_PT_autotrack_main(Panel):
         col.prop(scene, "autotrack_tracking_strategy", text="Tracking Strategy")
         col.prop(scene, "autotrack_rate")
         col.prop(scene, "autotrack_min_tracks")
+        col.prop(scene, "autotrack_max_new_tracks")
         col.prop(scene, 'autotrack_filter_mintime', text="Min Duration")
 
         # --- SOLVING CONTROLS ---
@@ -998,6 +1023,13 @@ def register():
         description='Retry feature detection with looser settings when active tracks fall below this count',
         default=20,
         min=0
+    )
+    Scene.autotrack_max_new_tracks = IntProperty(
+        name='Max New Tracks',
+        description='Maximum number of newly detected trackers to keep per cleanup cycle',
+        default=80,
+        min=1,
+        max=1000
     )
     Scene.autotrack_auto_solve_after_track = BoolProperty(
         name='Auto Solve After Track',
@@ -1120,6 +1152,7 @@ def unregister():
     for prop_name in (
         'autotrack_rate',
         'autotrack_min_tracks',
+        'autotrack_max_new_tracks',
         'autotrack_auto_solve_after_track',
         'autotrack_tracking_strategy',
         'autotrack_active_tracking_strategy',
