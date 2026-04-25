@@ -26,6 +26,7 @@ def log_msg(scene, message, icon='INFO'):
     print(f"[AutoTrack] {message}")
     
     try:
+        scene.autotrack_status = message
         item = scene.autotrack_log.add()
         item.message = message
         item.icon = icon
@@ -216,81 +217,83 @@ def solve_score(error, reconstructed_count, minimum_tracks):
     missing_tracks = max(0, minimum_tracks - reconstructed_count)
     return error + (missing_tracks * 0.05)
 
+SOLVE_SETTING_ATTRS = (
+    'refine_intrinsics',
+    'refine_intrinsics_focal_length',
+    'refine_intrinsics_principal_point',
+    'refine_intrinsics_radial_distortion',
+    'refine_intrinsics_tangential_distortion',
+    'use_keyframe_selection',
+)
+
+SOLVE_PRESETS = [
+    {
+        'name': 'No refinement',
+        'legacy_refine': 'NONE',
+        'focal': False,
+        'principal': False,
+        'radial': False,
+        'tangential': False,
+        'auto_keyframes': True,
+    },
+    {
+        'name': 'Focal length',
+        'legacy_refine': 'FOCAL_LENGTH',
+        'focal': True,
+        'principal': False,
+        'radial': False,
+        'tangential': False,
+        'auto_keyframes': True,
+    },
+    {
+        'name': 'Focal + radial distortion',
+        'legacy_refine': 'FOCAL_LENGTH_RADIAL_K1_K2',
+        'focal': True,
+        'principal': False,
+        'radial': True,
+        'tangential': False,
+        'auto_keyframes': True,
+    },
+    {
+        'name': 'Focal + optical center',
+        'legacy_refine': 'FOCAL_LENGTH_PRINCIPAL_POINT',
+        'focal': True,
+        'principal': True,
+        'radial': False,
+        'tangential': False,
+        'auto_keyframes': True,
+    },
+    {
+        'name': 'Focal + optical center + distortion',
+        'legacy_refine': 'FOCAL_LENGTH_PRINCIPAL_POINT_RADIAL_K1_K2',
+        'focal': True,
+        'principal': True,
+        'radial': True,
+        'tangential': True,
+        'auto_keyframes': True,
+    },
+    {
+        'name': 'Focal + distortion, fixed keyframes',
+        'legacy_refine': 'FOCAL_LENGTH_RADIAL_K1_K2',
+        'focal': True,
+        'principal': False,
+        'radial': True,
+        'tangential': False,
+        'auto_keyframes': False,
+    },
+]
+
 def optimize_solve_settings(context, scene, clip, active_obj):
     settings = clip.tracking.settings
-    attrs = (
-        'refine_intrinsics',
-        'refine_intrinsics_focal_length',
-        'refine_intrinsics_principal_point',
-        'refine_intrinsics_radial_distortion',
-        'refine_intrinsics_tangential_distortion',
-        'use_keyframe_selection',
-    )
-    original = save_settings(settings, attrs)
+    original = save_settings(settings, SOLVE_SETTING_ATTRS)
     original_tripod = get_setting(settings, 'use_tripod_solver')
     minimum_tracks = max(8, min(scene.autotrack_min_tracks, 40))
-    presets = [
-        {
-            'name': 'No refinement',
-            'legacy_refine': 'NONE',
-            'focal': False,
-            'principal': False,
-            'radial': False,
-            'tangential': False,
-            'auto_keyframes': True,
-        },
-        {
-            'name': 'Focal length',
-            'legacy_refine': 'FOCAL_LENGTH',
-            'focal': True,
-            'principal': False,
-            'radial': False,
-            'tangential': False,
-            'auto_keyframes': True,
-        },
-        {
-            'name': 'Focal + radial distortion',
-            'legacy_refine': 'FOCAL_LENGTH_RADIAL_K1_K2',
-            'focal': True,
-            'principal': False,
-            'radial': True,
-            'tangential': False,
-            'auto_keyframes': True,
-        },
-        {
-            'name': 'Focal + optical center',
-            'legacy_refine': 'FOCAL_LENGTH_PRINCIPAL_POINT',
-            'focal': True,
-            'principal': True,
-            'radial': False,
-            'tangential': False,
-            'auto_keyframes': True,
-        },
-        {
-            'name': 'Focal + optical center + distortion',
-            'legacy_refine': 'FOCAL_LENGTH_PRINCIPAL_POINT_RADIAL_K1_K2',
-            'focal': True,
-            'principal': True,
-            'radial': True,
-            'tangential': True,
-            'auto_keyframes': True,
-        },
-        {
-            'name': 'Focal + distortion, fixed keyframes',
-            'legacy_refine': 'FOCAL_LENGTH_RADIAL_K1_K2',
-            'focal': True,
-            'principal': False,
-            'radial': True,
-            'tangential': False,
-            'auto_keyframes': False,
-        },
-    ]
 
     best = None
     best_snapshot = None
-    log_msg(scene, f'Trying {len(presets)} solve setting presets...', 'SETTINGS')
+    log_msg(scene, f'Trying {len(SOLVE_PRESETS)} solve setting presets...', 'SETTINGS')
 
-    for preset in presets:
+    for preset in SOLVE_PRESETS:
         restore_settings(settings, original)
         if original_tripod is not None:
             set_setting(settings, 'use_tripod_solver', original_tripod)
@@ -319,7 +322,7 @@ def optimize_solve_settings(context, scene, clip, active_obj):
                 'reconstructed': reconstructed,
                 'preset': preset,
             }
-            best_snapshot = save_settings(settings, attrs)
+            best_snapshot = save_settings(settings, SOLVE_SETTING_ATTRS)
 
     if not best:
         restore_settings(settings, original)
@@ -632,6 +635,81 @@ class CLIP_OT_autotrack_autosolve(Operator):
     _history = {} 
     _state = 'IDLE' 
     _optimized_solve_settings = False
+    _solve_opt_index = 0
+    _solve_opt_original = None
+    _solve_opt_original_tripod = None
+    _solve_opt_minimum_tracks = 8
+    _solve_opt_best = None
+    _solve_opt_best_snapshot = None
+
+    def start_solve_optimization(self, scene, clip):
+        settings = clip.tracking.settings
+        self._solve_opt_index = 0
+        self._solve_opt_original = save_settings(settings, SOLVE_SETTING_ATTRS)
+        self._solve_opt_original_tripod = get_setting(settings, 'use_tripod_solver')
+        self._solve_opt_minimum_tracks = max(8, min(scene.autotrack_min_tracks, 40))
+        self._solve_opt_best = None
+        self._solve_opt_best_snapshot = None
+        self._optimized_solve_settings = True
+        log_msg(scene, f'Trying {len(SOLVE_PRESETS)} solve setting presets...', 'SETTINGS')
+
+    def step_solve_optimization(self, context, scene, clip, active_obj):
+        settings = clip.tracking.settings
+
+        if self._solve_opt_index >= len(SOLVE_PRESETS):
+            if not self._solve_opt_best:
+                restore_settings(settings, self._solve_opt_original or {})
+                if self._solve_opt_original_tripod is not None:
+                    set_setting(settings, 'use_tripod_solver', self._solve_opt_original_tripod)
+                log_msg(scene, 'No valid optimized solve preset found; using current settings', 'ERROR')
+            else:
+                restore_settings(settings, self._solve_opt_best_snapshot or {})
+                if self._solve_opt_original_tripod is not None:
+                    set_setting(settings, 'use_tripod_solver', self._solve_opt_original_tripod)
+                best = self._solve_opt_best
+                log_msg(scene, f"Best solve preset: {best['name']} ({best['error']:.3f}px)", 'CHECKMARK')
+
+            self._state = 'SOLVING'
+            context.area.tag_redraw()
+            return
+
+        preset = SOLVE_PRESETS[self._solve_opt_index]
+        self._solve_opt_index += 1
+
+        restore_settings(settings, self._solve_opt_original or {})
+        if self._solve_opt_original_tripod is not None:
+            set_setting(settings, 'use_tripod_solver', self._solve_opt_original_tripod)
+
+        log_msg(scene, f"Solve preset {self._solve_opt_index}/{len(SOLVE_PRESETS)}: {preset['name']}", 'SETTINGS')
+        try:
+            apply_solve_preset(settings, preset)
+            bpy.ops.clip.solve_camera()
+        except Exception as exc:
+            log_msg(scene, f"{preset['name']}: skipped ({exc})", 'ERROR')
+            context.area.tag_redraw()
+            return
+
+        if not active_obj.reconstruction.is_valid:
+            log_msg(scene, f"{preset['name']}: invalid solve", 'X')
+            context.area.tag_redraw()
+            return
+
+        error = active_obj.reconstruction.average_error
+        reconstructed = count_reconstructed_tracks(active_obj.tracks)
+        score = solve_score(error, reconstructed, self._solve_opt_minimum_tracks)
+        log_msg(scene, f"{preset['name']}: err {error:.3f}, bundles {reconstructed}", 'DOT')
+
+        if self._solve_opt_best is None or score < self._solve_opt_best['score']:
+            self._solve_opt_best = {
+                'name': preset['name'],
+                'score': score,
+                'error': error,
+                'reconstructed': reconstructed,
+            }
+            self._solve_opt_best_snapshot = save_settings(settings, SOLVE_SETTING_ATTRS)
+            log_msg(scene, f"{preset['name']}: new best", 'CHECKMARK')
+
+        context.area.tag_redraw()
 
     def execute(self, context):
         return self.invoke(context, None)
@@ -647,16 +725,14 @@ class CLIP_OT_autotrack_autosolve(Operator):
             return {'CANCELLED'}
 
         if event.type == 'TIMER':
+            # STATE: OPTIMIZING SOLVE SETTINGS
+            if self._state == 'OPTIMIZING':
+                self.step_solve_optimization(context, scene, clip, active_obj)
+                return {'PASS_THROUGH'}
+
             # STATE: SOLVING
             if self._state == 'SOLVING':
-                if (
-                    self._iteration == 0 and
-                    not self._optimized_solve_settings and
-                    scene.autotrack_solve_optimize_settings
-                ):
-                    optimize_solve_settings(context, scene, clip, active_obj)
-                    self._optimized_solve_settings = True
-
+                log_msg(scene, f"Solve iteration {self._iteration + 1}/{self._max_iterations}", "INFO")
                 bpy.ops.clip.solve_camera()
                 
                 if not active_obj.reconstruction.is_valid:
@@ -744,15 +820,29 @@ class CLIP_OT_autotrack_autosolve(Operator):
             self.report({'ERROR'}, "No active tracking object")
             return {'CANCELLED'}
 
+        track_count = len(clip.tracking.objects.active.tracks)
+        if track_count > scene.autotrack_solve_max_input_tracks:
+            message = (
+                f"Too many tracks to auto-solve safely ({track_count}). "
+                f"Clean tracks or raise Max Solve Tracks."
+            )
+            log_msg(scene, message, "ERROR")
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+
         log_msg(scene, "--- Starting Auto Solve ---", "TRIA_RIGHT")
         
         self._iteration = 0
         self._tracks_disabled_count = 0
         self._max_iterations = scene.autotrack_solve_max_iterations
         self._target_error = scene.autotrack_solve_target_error
-        self._state = 'SOLVING'
         self._state_from_prune = False
         self._optimized_solve_settings = False
+        if scene.autotrack_solve_optimize_settings:
+            self._state = 'OPTIMIZING'
+            self.start_solve_optimization(scene, clip)
+        else:
+            self._state = 'SOLVING'
         
         wm = context.window_manager
         self._timer = wm.event_timer_add(time_step=0.1, window=context.window)
@@ -792,6 +882,13 @@ class CLIP_OT_autotrack_autosolve(Operator):
         self.cancel(context)
 
     def cancel(self, context):
+        if self._state == 'OPTIMIZING' and self._solve_opt_original is not None:
+            clip = context.area.spaces.active.clip if context.area and context.area.spaces.active else None
+            if clip:
+                restore_settings(clip.tracking.settings, self._solve_opt_original)
+                if self._solve_opt_original_tripod is not None:
+                    set_setting(clip.tracking.settings, 'use_tripod_solver', self._solve_opt_original_tripod)
+
         wm = context.window_manager
         if self._timer: wm.event_timer_remove(self._timer)
         context.area.tag_redraw()
@@ -875,6 +972,9 @@ class CLIP_PT_autotrack_main(Panel):
         row.label(text=f"Active: {count_active}", icon='DOT')
         row.label(text=f"Finished: {count_finished}", icon='SOLO_OFF')
 
+        if scene.autotrack_status:
+            box.label(text=scene.autotrack_status, icon='INFO')
+
         # --- LOG SECTION ---
         layout.separator()
         row = layout.row()
@@ -919,6 +1019,7 @@ class CLIP_PT_autotrack_main(Panel):
         col.prop(scene, "autotrack_solve_optimize_settings", text="Try Solve Settings")
         col.prop(scene, "autotrack_solve_target_error", text="Target Error")
         col.prop(scene, "autotrack_solve_max_iterations", text="Max Iterations")
+        col.prop(scene, "autotrack_solve_max_input_tracks", text="Max Solve Tracks")
         
         col.separator()
         col.scale_y = 1.5
@@ -1139,8 +1240,20 @@ def register():
         min=1,
         max=200
     )
+    Scene.autotrack_solve_max_input_tracks = IntProperty(
+        name='Max Solve Tracks',
+        description='Cancel Auto Solve before launching if the active object has more tracks than this',
+        default=300,
+        min=20,
+        max=5000
+    )
     
     # Log Properties
+    Scene.autotrack_status = StringProperty(
+        name='Status',
+        description='Latest Auto-track status message',
+        default=''
+    )
     Scene.autotrack_log = CollectionProperty(type=AutoTrackLogItem)
     Scene.autotrack_log_index = IntProperty()
 
@@ -1167,6 +1280,8 @@ def unregister():
         'autotrack_solve_optimize_settings',
         'autotrack_solve_target_error',
         'autotrack_solve_max_iterations',
+        'autotrack_solve_max_input_tracks',
+        'autotrack_status',
         'autotrack_log',
         'autotrack_log_index',
     ):
