@@ -3,6 +3,8 @@
 
 import time
 import math
+import os
+import sys
 import bpy
 from bpy.types import Operator, Panel, Scene, PropertyGroup, UIList
 from bpy.props import (
@@ -27,6 +29,7 @@ class AutoTrackLogItem(PropertyGroup):
 class AutoTrackResultItem(PropertyGroup):
     scenario: StringProperty()
     solve: StringProperty()
+    clip_name: StringProperty()
     error: FloatProperty(default=0.0)
     bundles: IntProperty(default=0)
     score: FloatProperty(default=0.0)
@@ -67,22 +70,68 @@ def ensure_console_open():
     if AUTO_CONSOLE_OPENED:
         return
 
+    opened = False
     console_toggle = getattr(bpy.ops.wm, 'console_toggle', None)
-    if not console_toggle:
-        AUTO_CONSOLE_OPENED = True
-        return
+    if console_toggle:
+        try:
+            result = console_toggle()
+            opened = result != {'CANCELLED'}
+        except Exception:
+            opened = False
 
-    try:
-        console_toggle()
-        AUTO_CONSOLE_OPENED = True
-    except Exception:
-        AUTO_CONSOLE_OPENED = True
+    if os.name == 'nt':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            hwnd = kernel32.GetConsoleWindow()
+            if not hwnd:
+                kernel32.AllocConsole()
+                hwnd = kernel32.GetConsoleWindow()
+            if hwnd:
+                user32.ShowWindow(hwnd, 5)
+                try:
+                    sys.stdout = open('CONOUT$', 'w', encoding='utf-8', buffering=1)
+                    sys.stderr = open('CONOUT$', 'w', encoding='utf-8', buffering=1)
+                except Exception:
+                    pass
+                opened = True
+        except Exception:
+            pass
+
+    AUTO_CONSOLE_OPENED = opened
 
 def get_nearby_marker(track, frame):
     marker = track.markers.find_frame(frame, exact=True)
     if marker:
         return marker
     return track.markers.find_frame(frame - 1, exact=True)
+
+def get_marker_for_tracking(track, preferred_frame, max_distance=None):
+    marker = get_nearby_marker(track, preferred_frame)
+    if marker:
+        return marker
+
+    best_marker = None
+    best_distance = None
+    for candidate in track.markers:
+        if candidate.mute:
+            continue
+        distance = abs(candidate.frame - preferred_frame)
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_marker = candidate
+
+    if max_distance is not None and (best_distance is None or best_distance > max_distance):
+        return None
+
+    return best_marker
+
+def get_track_marker_span(track):
+    frames = [marker.frame for marker in track.markers if not marker.mute]
+    if len(frames) < 2:
+        return 0
+    return max(frames) - min(frames)
 
 def count_recent_valid_markers(track, start_frame, end_frame):
     count = 0
@@ -116,17 +165,30 @@ def get_clip_context(context):
     space = next((item for item in area.spaces if item.type == 'CLIP_EDITOR'), None)
     return area, region, space
 
-def call_clip_op(context, operator, *args, **kwargs):
+def get_active_clip_space(context):
     area, region, space = get_clip_context(context)
+    return space
+
+def call_clip_op(context, operator, *args, area=None, space=None, invoke=False, **kwargs):
+    if area and not space:
+        space = next((item for item in area.spaces if item.type == 'CLIP_EDITOR'), None)
+    if not area or not space:
+        area, region, space = get_clip_context(context)
+    else:
+        region = next((item for item in area.regions if item.type == 'WINDOW'), None)
+
     if not area or not region or not space:
         raise RuntimeError("No valid Movie Clip Editor context")
 
     with context.temp_override(area=area, region=region, space_data=space):
+        if invoke:
+            return operator('INVOKE_DEFAULT', *args, **kwargs)
         return operator(*args, **kwargs)
 
-def set_tracking_frame(context, frame):
+def set_tracking_frame(context, frame, space=None):
     context.scene.frame_set(frame)
-    space = get_clip_space(context)
+    if not space:
+        space = get_clip_space(context) or get_active_clip_space(context)
     clip_user = getattr(space, 'clip_user', None) if space else None
     if clip_user and hasattr(clip_user, 'frame_current'):
         try:
@@ -135,9 +197,12 @@ def set_tracking_frame(context, frame):
             pass
     return context.scene.frame_current
 
-def set_clip_frame(context, frame):
-    scene_frame = set_tracking_frame(context, frame)
-    area, region, space = get_clip_context(context)
+def set_clip_frame(context, frame, area=None, space=None):
+    if area and not space:
+        space = next((item for item in area.spaces if item.type == 'CLIP_EDITOR'), None)
+    if not space:
+        area, region, space = get_clip_context(context)
+    scene_frame = set_tracking_frame(context, frame, space=space)
     clip_user = getattr(space, 'clip_user', None) if space else None
     if clip_user and hasattr(clip_user, 'frame_current'):
         try:
@@ -170,24 +235,26 @@ def delete_tracks(tracks):
         set_track_selected(track, True)
     bpy.ops.clip.delete_track()
 
-def delete_tracks_in_context(context, tracks):
+def delete_tracks_in_context(context, tracks, area=None, space=None):
     if not tracks:
         return
-    call_clip_op(context, bpy.ops.clip.select_all, action='DESELECT')
+    call_clip_op(context, bpy.ops.clip.select_all, area=area, space=space, action='DESELECT')
     for track in tracks:
         set_track_selected(track, True)
-    call_clip_op(context, bpy.ops.clip.delete_track)
+    call_clip_op(context, bpy.ops.clip.delete_track, area=area, space=space)
 
-def detect_trial_features(context, scene, clip, scenario, threshold_scale=1.0, distance_scale=1.0):
+def detect_trial_features(context, scene, clip, scenario, threshold_scale=1.0, distance_scale=1.0, area=None, space=None):
     tracks = clip.tracking.tracks
     existing_track_keys = {track_key(track) for track in tracks}
     threshold = max(0.0001, scene.autotrack_detect_threshold * scenario['detect_threshold_scale'] * threshold_scale)
     distance = max(2, int(scene.autotrack_detect_distance * scenario['detect_distance_scale'] * distance_scale))
 
-    call_clip_op(context, bpy.ops.clip.select_all, action='DESELECT')
+    call_clip_op(context, bpy.ops.clip.select_all, area=area, space=space, action='DESELECT')
     call_clip_op(
         context,
         bpy.ops.clip.detect_features,
+        area=area,
+        space=space,
         threshold=threshold,
         min_distance=distance,
         margin=scene.autotrack_detect_margin,
@@ -196,7 +263,7 @@ def detect_trial_features(context, scene, clip, scenario, threshold_scale=1.0, d
 
     new_trackers = [t for t in tracks if track_key(t) not in existing_track_keys]
     if len(new_trackers) > scene.autotrack_max_new_tracks:
-        delete_tracks_in_context(context, new_trackers[scene.autotrack_max_new_tracks:])
+        delete_tracks_in_context(context, new_trackers[scene.autotrack_max_new_tracks:], area=area, space=space)
         new_trackers = new_trackers[:scene.autotrack_max_new_tracks]
 
     return new_trackers, threshold, distance
@@ -346,9 +413,9 @@ def clear_tracking_tracks():
     bpy.ops.clip.select_all(action='SELECT')
     bpy.ops.clip.delete_track()
 
-def clear_tracking_tracks_in_context(context):
-    call_clip_op(context, bpy.ops.clip.select_all, action='SELECT')
-    call_clip_op(context, bpy.ops.clip.delete_track)
+def clear_tracking_tracks_in_context(context, area=None, space=None):
+    call_clip_op(context, bpy.ops.clip.select_all, area=area, space=space, action='SELECT')
+    call_clip_op(context, bpy.ops.clip.delete_track, area=area, space=space)
 
 def tracking_scenario_summary(scenario):
     return (
@@ -368,8 +435,8 @@ def apply_solve_preset(settings, preset):
     if 'auto_keyframes' in preset:
         set_setting(settings, 'use_keyframe_selection', preset['auto_keyframes'])
 
-def solve_score(error, reconstructed_count, minimum_tracks):
-    if error is None:
+def solve_score(error, reconstructed_count, minimum_tracks, minimum_error=0.1):
+    if error is None or not math.isfinite(error) or error < minimum_error:
         return float('inf')
     missing_tracks = max(0, minimum_tracks - reconstructed_count)
     return error + (missing_tracks * 0.05)
@@ -468,7 +535,10 @@ def optimize_solve_settings(context, scene, clip, active_obj):
 
         error = active_obj.reconstruction.average_error
         reconstructed = count_reconstructed_tracks(active_obj.tracks)
-        score = solve_score(error, reconstructed, minimum_tracks)
+        score = solve_score(error, reconstructed, minimum_tracks, scene.autotrack_solve_min_valid_error)
+        if score == float('inf'):
+            log_msg(scene, f"{preset['name']}: ignored suspicious error {error:.3f}", 'X')
+            continue
         log_msg(scene, f"{preset['name']}: err {error:.3f}, bundles {reconstructed}", 'DOT')
 
         if best is None or score < best['score']:
@@ -513,11 +583,14 @@ class CLIP_UL_autotrack_results(UIList):
         row.label(text=f"{index + 1}: {item.error:.3f}px", icon='CHECKMARK')
         row.label(text=f"{item.bundles} bundles")
         row.label(text=item.scenario)
+        op = row.operator('autotrack.restore_best', text="", icon='RECOVER_LAST')
+        op.result_index = index
 
 def add_result_item(scene, result):
     item = scene.autotrack_results.add()
     item.scenario = f"{result['scenario']['name']} / {result['solve_name']}"
     item.solve = result['solve_name']
+    item.clip_name = result['clip'].name if result.get('clip') else ''
     item.error = result['error']
     item.bundles = result['bundles']
     item.score = result['score']
@@ -815,6 +888,8 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
     _solve_minimum_tracks = 8
     _scenario_best = None
     _scenario_best_snapshot = None
+    _clip_area = None
+    _clip_space = None
 
     @classmethod
     def poll(cls, context):
@@ -826,7 +901,13 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
     def invoke(self, context, event):
         ensure_console_open()
         scene = context.scene
-        space = context.area.spaces.active
+        area, region, space = get_clip_context(context)
+        if not space:
+            self.report({'ERROR'}, "No Movie Clip Editor area found")
+            return {'CANCELLED'}
+
+        self._clip_area = area
+        self._clip_space = space
         self._original_clip = space.clip
 
         if not self._original_clip:
@@ -874,7 +955,11 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
 
     def step_scenario(self, context):
         scene = context.scene
-        space = context.area.spaces.active
+        space = self._clip_space or get_active_clip_space(context)
+        if not space:
+            log_msg(scene, "No Movie Clip Editor available during optimization", "ERROR")
+            self.cancel(context)
+            return {'CANCELLED'}
 
         if self._scenario_index >= len(self._scenarios):
             self._state = 'FINISH'
@@ -889,12 +974,12 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
         self._current_clip = trial_clip
         self._current_scenario = scenario
         space.clip = trial_clip
-        set_tracking_frame(context, scene.frame_start)
+        set_tracking_frame(context, scene.frame_start, space=self._clip_space)
 
         log_msg(scene, f"Scenario {scenario['index']}/{len(self._scenarios)}: {tracking_scenario_summary(scenario)}", 'PLAY')
 
         try:
-            clear_tracking_tracks_in_context(context)
+            clear_tracking_tracks_in_context(context, area=self._clip_area, space=self._clip_space)
             tracked = self.run_tracking_trial(context, scene, trial_clip, scenario)
         except Exception as exc:
             log_msg(scene, f"Scenario {scenario['index']} failed: {exc}", 'ERROR')
@@ -941,7 +1026,7 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
         log_msg(scene, f"Scenario {scenario['index']}: solve {self._solve_index}/{len(SOLVE_PRESETS)} {preset['name']}", 'SETTINGS')
         try:
             apply_solve_preset(settings, preset)
-            call_clip_op(context, bpy.ops.clip.solve_camera)
+            call_clip_op(context, bpy.ops.clip.solve_camera, area=self._clip_area, space=self._clip_space)
         except Exception as exc:
             log_msg(scene, f"Scenario {scenario['index']} solve skipped: {exc}", 'ERROR')
             return {'PASS_THROUGH'}
@@ -952,7 +1037,10 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
 
         error = active_obj.reconstruction.average_error
         bundles = count_reconstructed_tracks(active_obj.tracks)
-        score = solve_score(error, bundles, self._solve_minimum_tracks)
+        score = solve_score(error, bundles, self._solve_minimum_tracks, scene.autotrack_solve_min_valid_error)
+        if score == float('inf'):
+            log_msg(scene, f"Scenario {scenario['index']} solve ignored suspicious error {error:.3f}: {preset['name']}", 'X')
+            return {'PASS_THROUGH'}
         log_msg(scene, f"Scenario {scenario['index']} solve result: {preset['name']} err {error:.3f}, bundles {bundles}", 'DOT')
 
         if self._scenario_best is None or score < self._scenario_best['score']:
@@ -985,7 +1073,7 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
         restore_settings(settings, self._scenario_best_snapshot or {})
         if self._solve_original_tripod is not None:
             set_setting(settings, 'use_tripod_solver', self._solve_original_tripod)
-        call_clip_op(context, bpy.ops.clip.solve_camera)
+        call_clip_op(context, bpy.ops.clip.solve_camera, area=self._clip_area, space=self._clip_space)
 
         scenario_best = self._scenario_best
         scenario_best['clip'] = clip
@@ -1005,7 +1093,11 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
 
     def finish_optimizer(self, context):
         scene = context.scene
-        space = context.area.spaces.active
+        space = self._clip_space or get_active_clip_space(context)
+        if not space:
+            log_msg(scene, "No Movie Clip Editor available to restore winner", "ERROR")
+            self.cancel(context)
+            return {'CANCELLED'}
 
         if not self._best:
             space.clip = self._original_clip
@@ -1016,7 +1108,7 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
 
         space.clip = self._best['clip']
         scene.autotrack_best_clip_name = self._best['clip'].name
-        set_tracking_frame(context, scene.frame_start)
+        set_tracking_frame(context, scene.frame_start, space=self._clip_space)
         log_msg(
             scene,
             f"Winner: scenario {self._best['scenario']['index']} ({self._best['scenario']['name']}), solve {self._best['solve_name']}, error {self._best['error']:.3f}",
@@ -1036,7 +1128,9 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
         if self._timer:
             wm.event_timer_remove(self._timer)
             self._timer = None
-        if context.area:
+        if self._clip_area:
+            self._clip_area.tag_redraw()
+        elif context.area:
             context.area.tag_redraw()
 
     def run_tracking_trial(self, context, scene, clip, scenario):
@@ -1049,7 +1143,7 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
         total_tracking_steps = 0
 
         for cycle in range(max_cycles):
-            frame = set_clip_frame(context, min(frame, frame_end))
+            frame = set_clip_frame(context, min(frame, frame_end), area=self._clip_area, space=self._clip_space)
             if frame >= frame_end:
                 break
 
@@ -1068,7 +1162,9 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
                         clip,
                         scenario,
                         threshold_scale=threshold_scale,
-                        distance_scale=distance_scale
+                        distance_scale=distance_scale,
+                        area=self._clip_area,
+                        space=self._clip_space
                     )
                     log_msg(
                         scene,
@@ -1078,15 +1174,17 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
                     if new_trackers:
                         break
 
-            call_clip_op(context, bpy.ops.clip.select_all, action='DESELECT')
+            call_clip_op(context, bpy.ops.clip.select_all, area=self._clip_area, space=self._clip_space, action='DESELECT')
             count_tracking = 0
             for track in tracks:
                 if track.hide or track.lock:
                     continue
 
-                marker = get_nearby_marker(track, frame)
+                marker = get_marker_for_tracking(track, frame, max_distance=max(1, scene.autotrack_rate))
                 if marker and not marker.mute:
                     set_track_selected(track, True)
+                    if marker.frame != frame:
+                        log_msg(scene, f"Scenario {scenario['index']}: using marker frame {marker.frame} while scene frame is {frame}", 'INFO')
                     track.frames_limit = min(scene.autotrack_rate, max(1, frame_end - frame))
                     count_tracking += 1
 
@@ -1096,15 +1194,18 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
 
             target = min(frame + scene.autotrack_rate, frame_end)
             log_msg(scene, f"Scenario {scenario['index']}: tracking {count_tracking} tracks {frame}->{target}", 'PLAY')
-            call_clip_op(context, bpy.ops.clip.track_markers, backwards=False, sequence=True)
+            call_clip_op(context, bpy.ops.clip.track_markers, area=self._clip_area, space=self._clip_space, backwards=False, sequence=True)
             total_tracking_steps += 1
+
+            tracked_now = sum(1 for track in clip.tracking.tracks if get_track_marker_span(track) > 0)
+            log_msg(scene, f"Scenario {scenario['index']}: {tracked_now} tracks now have motion spans", 'DOT')
 
             next_frame = scene.frame_current
             if next_frame <= frame:
                 next_frame = target
             frame = next_frame
 
-        tracked_markers = sum(1 for track in clip.tracking.tracks if len(track.markers) > 1)
+        tracked_markers = sum(1 for track in clip.tracking.tracks if get_track_marker_span(track) > 0)
         if total_tracking_steps == 0 or tracked_markers < 8:
             log_msg(scene, f"Scenario {scenario['index']}: skipped solve, only {tracked_markers} tracks have multiple markers", 'ERROR')
             return False
@@ -1131,7 +1232,7 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
             log_msg(scene, f"Scenario {scenario['index']}: solve {solve_index}/{len(SOLVE_PRESETS)} {preset['name']}", 'SETTINGS')
             try:
                 apply_solve_preset(settings, preset)
-                call_clip_op(context, bpy.ops.clip.solve_camera)
+                call_clip_op(context, bpy.ops.clip.solve_camera, area=self._clip_area, space=self._clip_space)
             except Exception as exc:
                 log_msg(scene, f"Scenario {scenario['index']} solve skipped: {exc}", 'ERROR')
                 continue
@@ -1141,7 +1242,10 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
 
             error = active_obj.reconstruction.average_error
             bundles = count_reconstructed_tracks(active_obj.tracks)
-            score = solve_score(error, bundles, minimum_tracks)
+            score = solve_score(error, bundles, minimum_tracks, scene.autotrack_solve_min_valid_error)
+            if score == float('inf'):
+                log_msg(scene, f"Scenario {scenario['index']} solve ignored suspicious error {error:.3f}: {preset['name']}", 'X')
+                continue
 
             if best is None or score < best['score']:
                 best = {
@@ -1162,7 +1266,7 @@ class CLIP_OT_autotrack_optimize_track_and_solve(Operator):
         restore_settings(settings, best_snapshot)
         if original_tripod is not None:
             set_setting(settings, 'use_tripod_solver', original_tripod)
-        call_clip_op(context, bpy.ops.clip.solve_camera)
+        call_clip_op(context, bpy.ops.clip.solve_camera, area=self._clip_area, space=self._clip_space)
         return best
 
 
@@ -1171,6 +1275,8 @@ class CLIP_OT_autotrack_restore_best(Operator):
     bl_label = 'Restore Best Result'
     bl_description = 'Switch the Movie Clip Editor back to the best optimized tracking result'
     bl_options = {'REGISTER'}
+
+    result_index: IntProperty(default=-1)
 
     @classmethod
     def poll(cls, context):
@@ -1182,7 +1288,19 @@ class CLIP_OT_autotrack_restore_best(Operator):
 
     def execute(self, context):
         scene = context.scene
-        clip_name = scene.autotrack_best_clip_name
+        clip_name = ''
+        result_index = self.result_index
+
+        if result_index < 0:
+            result_index = scene.autotrack_results_index
+
+        if 0 <= result_index < len(scene.autotrack_results):
+            scene.autotrack_results_index = result_index
+            clip_name = scene.autotrack_results[result_index].clip_name
+
+        if not clip_name:
+            clip_name = scene.autotrack_best_clip_name
+
         if not clip_name:
             self.report({'ERROR'}, "No best result has been stored yet")
             log_msg(scene, "No best result has been stored yet", "ERROR")
@@ -1196,7 +1314,7 @@ class CLIP_OT_autotrack_restore_best(Operator):
 
         context.area.spaces.active.clip = clip
         set_tracking_frame(context, scene.frame_start)
-        log_msg(scene, f"Restored best result: {clip.name}", "CHECKMARK")
+        log_msg(scene, f"Restored result: {clip.name}", "CHECKMARK")
         return {'FINISHED'}
 
 
@@ -1282,7 +1400,11 @@ class CLIP_OT_autotrack_autosolve(Operator):
 
         error = active_obj.reconstruction.average_error
         reconstructed = count_reconstructed_tracks(active_obj.tracks)
-        score = solve_score(error, reconstructed, self._solve_opt_minimum_tracks)
+        score = solve_score(error, reconstructed, self._solve_opt_minimum_tracks, scene.autotrack_solve_min_valid_error)
+        if score == float('inf'):
+            log_msg(scene, f"{preset['name']}: ignored suspicious error {error:.3f}", 'X')
+            context.area.tag_redraw()
+            return
         log_msg(scene, f"{preset['name']}: err {error:.3f}, bundles {reconstructed}", 'DOT')
 
         if self._solve_opt_best is None or score < self._solve_opt_best['score']:
@@ -1581,7 +1703,9 @@ class CLIP_PT_autotrack_main(Panel):
 
         if len(scene.autotrack_results) > 0:
             layout.separator()
-            layout.label(text="Optimization Results:")
+            row = layout.row(align=True)
+            row.label(text="Optimization Results:")
+            row.operator('autotrack.restore_best', text="", icon='RECOVER_LAST')
             layout.template_list(
                 "CLIP_UL_autotrack_results", "",
                 scene, "autotrack_results",
@@ -1595,7 +1719,7 @@ class CLIP_PT_autotrack_main(Panel):
         col = layout.column(align=True)
         col.scale_y = 1.5
         col.operator('autotrack.optimize_track_and_solve', text='Optimize Track + Solve', icon='MODIFIER')
-        col.operator('autotrack.restore_best', text='Restore Best Result', icon='RECOVER_LAST')
+        col.operator('autotrack.restore_best', text='Restore Selected/Best Result', icon='RECOVER_LAST')
         col.operator('autotrack.track_and_solve', text='Auto Track + Solve', icon='PLAY')
         col.operator('autotrack.auto_track', text='Start Auto Track', icon='CON_FOLLOWTRACK')
         
@@ -1619,6 +1743,7 @@ class CLIP_PT_autotrack_main(Panel):
         col.prop(scene, "autotrack_solve_delete_count", text="Del. Worst (Batch)")
         col.prop(scene, "autotrack_solve_optimize_settings", text="Try Solve Settings")
         col.prop(scene, "autotrack_solve_target_error", text="Target Error")
+        col.prop(scene, "autotrack_solve_min_valid_error", text="Min Valid Error")
         col.prop(scene, "autotrack_solve_max_iterations", text="Max Iterations")
         col.prop(scene, "autotrack_solve_max_input_tracks", text="Max Solve Tracks")
         
@@ -1856,6 +1981,13 @@ def register():
         default=0.3,
         min=0.0
     )
+    Scene.autotrack_solve_min_valid_error = FloatProperty(
+        name='Min Valid Error',
+        description='Ignore solves below this error as suspicious failed solves',
+        precision=3,
+        default=0.1,
+        min=0.0
+    )
     Scene.autotrack_solve_max_iterations = IntProperty(
         name='Max Iterations',
         description='Maximum Auto Solve prune/solve attempts',
@@ -1907,6 +2039,7 @@ def unregister():
         'autotrack_solve_delete_count',
         'autotrack_solve_optimize_settings',
         'autotrack_solve_target_error',
+        'autotrack_solve_min_valid_error',
         'autotrack_solve_max_iterations',
         'autotrack_solve_max_input_tracks',
         'autotrack_status',
